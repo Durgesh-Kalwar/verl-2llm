@@ -339,6 +339,7 @@ class DataProto:
             elif isinstance(val, np.ndarray):
                 non_tensors[key] = val
             else:
+                print(f"Unsupported key:{key} type in data {type(val)}")
                 raise ValueError(f"Unsupported type in data {type(val)}")
 
         return cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info, auto_padding=auto_padding)

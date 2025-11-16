@@ -382,6 +382,7 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                 metric = {}
                 n_resps = len(var_vals)
                 metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                metric[f"pass@{n_resps}"] = np.any(var_vals)
 
                 if n_resps > 1:
                     metric[f"std@{n_resps}"] = np.std(var_vals)

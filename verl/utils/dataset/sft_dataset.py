@@ -22,12 +22,14 @@ from typing import List, Union
 
 import pandas as pd
 import torch
+import datasets
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
+import verl.utils.torch_functional as verl_F
 
 
 class SFTDataset(Dataset):
@@ -38,7 +40,7 @@ class SFTDataset(Dataset):
         config (OmegaConf): the data config
     """
 
-    def __init__(self, parquet_files: Union[str, List[str]], tokenizer, config):
+    def __init__(self, parquet_files: Union[str, List[str]], tokenizer, config, val_flag=False):
         prompt_key = config.get("prompt_key", "prompt")
         prompt_dict_keys = config.get("prompt_dict_keys", None)
         response_key = config.get("response_key", "response")
@@ -46,6 +48,8 @@ class SFTDataset(Dataset):
         max_length = config.get("max_length", 1024)
         truncation = config.get("truncation", "error")
         use_shm = config.get("use_shm", False)
+
+        self.val_flag = val_flag
 
         assert truncation in ["error", "left", "right"]
         self.truncation = truncation
@@ -85,38 +89,73 @@ class SFTDataset(Dataset):
         dataframes = []
         for parquet_file in self.parquet_files:
             # read parquet files and cache
-            dataframe = pd.read_parquet(parquet_file)
+            if not self.val_flag:
+                dataframe = pd.read_parquet(parquet_file)
+            else:
+                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
             dataframes.append(dataframe)
-        self.dataframe = pd.concat(dataframes)
-        self.prompts = self.dataframe[self.prompt_key]
-        for key in self.prompt_dict_keys:
-            # type(x): pandas.core.series.Series
-            # type(x[0]): numpy.ndarray
-            # type(x[0][0]): dict
-            try:
-                self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
-            except Exception:
-                print(f"self.prompts={self.prompts}")
-                raise
-        if isinstance(self.prompts, pd.DataFrame):
-            self.prompts = self.prompts.squeeze()
-        self.prompts = self.prompts.tolist()
-        self.responses = self.dataframe[self.response_key]
-        for key in self.response_dict_keys:
-            try:
-                self.responses = self.responses.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
-            except Exception:
-                print(f"self.responses={self.responses}")
-                raise
-        if isinstance(self.responses, pd.DataFrame):
-            self.responses = self.responses.squeeze()
-        self.responses = self.responses.tolist()
+        if self.val_flag:
+            self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        else:
+            self.dataframe = pd.concat(dataframes)
+            self.prompts = self.dataframe[self.prompt_key]
+            for key in self.prompt_dict_keys:
+                # type(x): pandas.core.series.Series
+                # type(x[0]): numpy.ndarray
+                # type(x[0][0]): dict
+                try:
+                    self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
+                except Exception:
+                    print(f"self.prompts={self.prompts}")
+                    raise
+            if isinstance(self.prompts, pd.DataFrame):
+                self.prompts = self.prompts.squeeze()
+            self.prompts = self.prompts.tolist()
+            self.responses = self.dataframe[self.response_key]
+            for key in self.response_dict_keys:
+                try:
+                    self.responses = self.responses.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
+                except Exception:
+                    print(f"self.responses={self.responses}")
+                    raise
+            if isinstance(self.responses, pd.DataFrame):
+                self.responses = self.responses.squeeze()
+            self.responses = self.responses.tolist()
 
     def __len__(self):
-        return len(self.prompts)
+        if self.val_flag:
+            return len(self.dataframe)
+        else:
+            return len(self.prompts)
 
     def __getitem__(self, item):
         tokenizer = self.tokenizer
+        if self.val_flag:
+            # raw_dict = self.dataframe.iloc[item].to_dict()
+            raw_dict: dict = self.dataframe[item]
+            messages: list = raw_dict.pop('prompt')
+
+            model_inputs = {}
+            #raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = messages[0]['content']
+            model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
+            val_input_ids = model_inputs.pop("input_ids")
+            val_attention_mask = model_inputs.pop("attention_mask")
+
+            val_input_ids, val_attention_mask = verl_F.postprocess_data(
+            input_ids=val_input_ids,
+            attention_mask=val_attention_mask,
+            max_length=256,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=self.truncation, )
+
+            val_position_ids = compute_position_id_with_mask(val_attention_mask)
+
+            raw_dict["input_ids"] = val_input_ids[0]
+            raw_dict["attention_mask"] = val_attention_mask[0]
+            raw_dict["position_ids"] = val_position_ids[0]
+            return raw_dict
 
         prompt = self.prompts[item]
         response = self.responses[item]
@@ -125,11 +164,12 @@ class SFTDataset(Dataset):
         prompt_chat = [{"role": "user", "content": prompt}]
 
         # string
-        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        # prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
         response_chat_str = response + tokenizer.eos_token
 
         # tokenize
-        prompt_ids_output = tokenizer(prompt_chat_str, return_tensors="pt", add_special_tokens=False)
+        # prompt_ids_output = tokenizer(prompt_chat_str, return_tensors="pt", add_special_tokens=False)
+        prompt_ids_output = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         prompt_ids = prompt_ids_output["input_ids"][0]
         prompt_attention_mask = prompt_ids_output["attention_mask"][0]
 
@@ -173,9 +213,19 @@ class SFTDataset(Dataset):
         # mask out the last token in response
         loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
 
+        # if self.val_flag:
+        #     return {
+        #     "input_ids": input_ids,
+        #     "attention_mask": attention_mask,
+        #     "position_ids": position_ids,
+        #     "loss_mask": loss_mask,
+        #     "val_input_ids": val_input_ids[0],
+        #     "val_attention_mask": val_attention_mask[0],
+        #     "val_position_ids": val_position_ids[0]}
+        # else:
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
-            "loss_mask": loss_mask,
-        }
+            "loss_mask": loss_mask, }

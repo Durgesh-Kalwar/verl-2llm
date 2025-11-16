@@ -205,6 +205,20 @@ def apply_monkey_patch(
     except AttributeError:
         num_attention_heads, num_key_value_heads = model.config.text_config.num_attention_heads, model.config.text_config.num_key_value_heads
 
+    # # In monkey_patch.py
+
+    # try:
+    #     # Standard config access
+    #     config = model.config
+    # except AttributeError:
+    #     # Fallback for models with a nested text_config
+    #     config = model.config.text_config
+
+    # num_attention_heads = config.num_attention_heads
+    # # For models like GPT-Neo (MHA), num_key_value_heads is the same as num_attention_heads.
+    # # We use getattr to provide this as a fallback if the attribute doesn't exist.
+    # num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
+    
     assert num_attention_heads % ulysses_sp_size == 0, f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
     assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (
         f"num_key_value_heads {num_key_value_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}or vise versa. Upon ulysses_sp_size % num_key_value_heads == 0,kv heads are repeated to ensure correctness."

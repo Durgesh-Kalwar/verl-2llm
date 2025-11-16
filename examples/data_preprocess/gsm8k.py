@@ -34,7 +34,7 @@ def extract_solution(solution_str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/gsm8k")
+    parser.add_argument("--local_dir", default="/scratch/dkalwar/verl-2llm/data/gsm8k")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
@@ -46,7 +46,8 @@ if __name__ == "__main__":
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    # instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
@@ -57,6 +58,8 @@ if __name__ == "__main__":
 
             answer_raw = example.pop("answer")
             solution = extract_solution(answer_raw)
+            cot_part = answer_raw.split("####")[0].strip()
+            answer = f"{cot_part}\nThe final answer is \\boxed{{{solution}}}"
             data = {
                 "data_source": data_source,
                 "prompt": [
@@ -70,7 +73,7 @@ if __name__ == "__main__":
                 "extra_info": {
                     "split": split,
                     "index": idx,
-                    "answer": answer_raw,
+                    "answer": answer,
                     "question": question_raw,
                 },
             }

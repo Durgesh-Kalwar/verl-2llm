@@ -35,6 +35,8 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+import json
+import os
 
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -58,6 +60,7 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.reward_score.blocksworld import extract_solution, extract_answer_from_solution
 
 WorkerType = Type[Worker]
 
@@ -660,6 +663,8 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            # final_answers = [extract_answer_from_solution(text_out) for text_out in output_texts]
+            # sample_outputs.extend(final_answers)
 
             test_batch = test_batch.union(test_output_gen_batch)
 
@@ -709,6 +714,55 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        # Group samples by data source
+        data_source_samples = {}
+        for idx, (inp, out, score, data_source) in enumerate(zip(sample_inputs, sample_outputs, sample_scores, data_sources)):
+            if data_source not in data_source_samples:
+                data_source_samples[data_source] = []
+            data_source_samples[data_source].append((idx, inp, out, score))
+
+        # Write samples to separate files for each data source
+        for data_source, samples in data_source_samples.items():
+            if data_source == 'lighteval/MATH':
+                data_source_name = 'MATH500'
+            elif data_source == 'openai/gsm8k':
+                data_source_name = 'GSM8K'
+            elif data_source == 'countdown':
+                data_source_name = 'countdown'
+            elif data_source == 'game24':
+                data_source_name = 'game24'
+            elif data_source == 'blocksworld':
+                data_source_name = 'blocksworld'
+            else:
+                data_source_name = 'GSM8K-Symbolic-P2'
+                # raise ValueError(f"Invalid data source: {data_source}")
+            output_path = self.config.trainer.experiment_name + "_global_steps_" + str(self.global_steps) + "_" + data_source_name + "_pass@" + str(self.config.actor_rollout_ref.rollout.val_kwargs.n) + "_validation_samples.txt"
+            with open(output_path, "w", encoding="utf-8") as f:
+                for idx, inp, out, score in samples:
+                    f.write(f"Sample {(idx)//self.config.actor_rollout_ref.rollout.val_kwargs.n}:\n")
+                    f.write(f"Input: {inp}\n")
+                    f.write(f"Output: {out}\n")
+                    f.write(f"Score: {score}\n")
+                    f.write("-" * 50 + "\n")
+        data_source_len_analysis = {}
+        for idx, (out_txt, score) in enumerate(zip(sample_outputs,sample_scores)):
+            data_source = data_sources[idx]
+            if data_source not in data_source_len_analysis:
+                data_source_len_analysis[data_source] = {"num_pos":0, "num_neg":0, "avg_pos_len":0, "avg_neg_len":0}
+            if score>=1.0:
+                data_source_len_analysis[data_source]["num_pos"]+=1
+                data_source_len_analysis[data_source]["avg_pos_len"]+=len(self.tokenizer.encode(out_txt, add_special_tokens=False))
+            elif score<=0.2:
+                data_source_len_analysis[data_source]["num_neg"]+=1
+                data_source_len_analysis[data_source]["avg_neg_len"]+=len(self.tokenizer.encode(out_txt, add_special_tokens=False))
+            else:
+                raise ValueError(f"Invalid score encountered: {score}")
+        for data_source, data_source_info in data_source_len_analysis.items():
+            metric_dict[f'val/num_positive_responses/{data_source}'] = data_source_info["num_pos"]
+            metric_dict[f'val/num_negative_responses/{data_source}'] = data_source_info["num_neg"]
+            metric_dict[f'val/pos_avg_res_len/{data_source}'] = data_source_info["avg_pos_len"]/(data_source_info["num_pos"]+1)
+            metric_dict[f'val/neg_avg_res_len/{data_source}'] = data_source_info["avg_neg_len"]/(data_source_info["num_neg"]+1)
 
         return metric_dict
 
@@ -834,7 +888,8 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
-    def _load_checkpoint(self):
+    def _load_checkpoint(self,step_number=None):
+        self.wandb_run_id = None
         if self.config.trainer.resume_mode == "disable":
             return 0
 
@@ -848,6 +903,10 @@ class RayPPOTrainer:
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
 
+            if step_number is not None:
+                import re
+                global_step_folder = re.sub(r"global_step_\d+", f"global_step_{step_number}", global_step_folder)
+        
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
@@ -868,22 +927,28 @@ class RayPPOTrainer:
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
 
+        wandb_run_id_tracker_file = os.path.join(checkpoint_folder, "latest_checkpointed_wandb_run_id.txt")
+        with open(wandb_run_id_tracker_file, "r") as f:
+            self.wandb_run_id = f.read().strip()
+
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
-        # load actor
-        self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
-        # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        if step_number != 0:
+            # load actor
+            self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+            # load critic
+            if self.use_critic:
+                self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+
+            # load dataloader,
+            # TODO: from remote not implemented yet
+            dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+            if os.path.exists(dataloader_local_path):
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            else:
+                print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -909,27 +974,65 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        logger = Tracking(
+        eval_flag = False
+
+        if eval_flag:
+            for gs in [100]:
+                self.global_steps = int(gs)
+
+                # load checkpoint before doing anything
+                if self.global_steps > 0:
+                    self._load_checkpoint(self.global_steps)
+
+                # perform validation before training
+                # currently, we only support validation using the reward_function.
+                # json_file_path = "validation_metrics_" + str(self.global_steps) + ".json"
+                # all_metrics = {}
+                for n_k in [4,16]:
+                    json_file_path = "validation_metrics_global_step_" + str(self.global_steps) + "_pass@" + str(n_k) + ".json"
+                    self.config.actor_rollout_ref.rollout.val_kwargs.n = int(n_k)
+                    if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+                        val_metrics = self._validate()
+                        assert val_metrics, f"{val_metrics=}"
+                        pprint(f"Initial validation metrics: {val_metrics}")
+
+                        # Store metrics for the current n_k
+                        if val_metrics:
+                            with open(json_file_path, 'w') as jsonfile:
+                                json.dump(val_metrics, jsonfile, indent=4)
+                            # all_metrics[n_k] = val_metrics
+
+                        # logger.log(data=val_metrics, step=self.global_steps)
+                        if self.config.trainer.get("val_only", False):
+                            pass
+                            # return
+                
+                # Save all metrics to a single JSON file
+                # with open(json_file_path, 'w') as jsonfile:
+                #     json.dump(all_metrics, jsonfile, indent=4)
+            return
+
+        else:
+            self.global_steps = 0
+            # load checkpoint before doing anything
+            self._load_checkpoint()
+            # self.wandb_run_id = None
+
+            logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
-        )
+            wandb_run_id=self.wandb_run_id,)
 
-        self.global_steps = 0
-
-        # load checkpoint before doing anything
-        self._load_checkpoint()
-
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+            # perform validation before training
+            # currently, we only support validation using the reward_function.
+            if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+                val_metrics = self._validate()
+                pprint(f'Initial validation metrics: {val_metrics}')
+                logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get('val_only', False):
+                    return
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")

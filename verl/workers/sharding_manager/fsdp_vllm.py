@@ -111,23 +111,32 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             if fsdp_version(self.module) > 0:
                 if self.layered_summon:
                     if not self.base_sync_done:
-                        raise ValueError("To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let rollout.load_format=safetensors")
+                        raise ValueError(
+                            "To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let "
+                            "rollout.load_format=safetensors"
+                        )
                     lora_params = layered_summon_lora_params(self.module)
                 else:
                     with FSDP.summon_full_params(self.module, writeback=False):
                         if self.base_sync_done:
                             lora_params = get_peft_model_state_dict(peft_model)
-                            lora_params = {name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu() for name, param in lora_params.items()}
+                            lora_params = {
+                                name: param.full_tensor().detach().cpu()
+                                if hasattr(param, "full_tensor")
+                                else param.detach().cpu()
+                                for name, param in lora_params.items()
+                            }
                         else:
                             model = peft_model.base_model.model
-                            orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
-                            model = model.to("cpu")
                             for name, param in model.state_dict().items():
                                 if any(x in name for x in ["_flat_param", "lora_"]):
                                     continue
                                 name = name.replace("_fsdp_wrapped_module.", "").replace(".base_layer", "")
-                                lora_params[name] = param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
-                            model = model.to(orig_dev)
+                                lora_params[name] = (
+                                    param.full_tensor().cpu().detach()
+                                    if hasattr(param, "full_tensor")
+                                    else param.detach().cpu()
+                                )
                     get_torch_device().empty_cache()
             else:
                 if self.base_sync_done:

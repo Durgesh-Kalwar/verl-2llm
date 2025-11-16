@@ -124,3 +124,9 @@ logs
 log
 outputs
 .history
+
+# Ignore plain text and json files in the examples/grpo_trainer folder (including subfolders)
+/examples/grpo_trainer/*.txt
+/examples/grpo_trainer/*.json
+/examples/grpo_trainer/**/*.txt
+/examples/grpo_trainer/**/*.json
