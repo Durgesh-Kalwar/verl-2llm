@@ -1,0 +1,11 @@
+(ventana)
+(agenda)
+  (
+    (putdown b1)
+    (
+      (pickup b3)
+      (
+        (stack b3 b2)
+      )
+    )
+  )

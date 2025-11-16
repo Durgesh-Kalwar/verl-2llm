@@ -1,0 +1,2 @@
+n_k,val-core/openai/gsm8k/reward/mean@1,val/neg_avg_res_len/openai/gsm8k,val/num_negative_responses/openai/gsm8k,val/num_positive_responses/openai/gsm8k,val/pos_avg_res_len/openai/gsm8k
+1,0.3593631539044731,292.74468085106383,845,474,297.87157894736845

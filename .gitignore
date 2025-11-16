@@ -130,3 +130,5 @@ outputs
 /examples/grpo_trainer/*.json
 /examples/grpo_trainer/**/*.txt
 /examples/grpo_trainer/**/*.json
+*.whl
+*.txt
